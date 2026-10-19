@@ -288,8 +288,15 @@ jobs:
                   val master = Switch(this).apply {
                       text = "Clock speed customization"; setTextColor(Color.WHITE); isEnabled = false
                   }
-                  col.addView(master)
-                          text = "แถบลอยที่ขอบจอ (แตะเปิดแผงจากทุกหน้า)"; setTextColor(Color.WHITE)
+                  master.setOnCheckedChangeListener { _, isChecked ->
+    if (isChecked) {
+        try {
+            Shizuku.newProcess(arrayOf("sh", "-c", "echo 1958000 > /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq"), null, null).waitFor()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+}                      text = "แถบลอยที่ขอบจอ (แตะเปิดแผงจากทุกหน้า)"; setTextColor(Color.WHITE)
                       isChecked = FloatingBarService.running
                   }
                   barSwitch.setOnCheckedChangeListener { btn, on ->
