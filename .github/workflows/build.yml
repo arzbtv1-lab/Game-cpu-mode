@@ -1,0 +1,444 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create project files
+        run: |
+          mkdir -p app
+          cat > app/build.gradle.kts <<'__END__'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.gamecpu.mode"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.gamecpu.mode"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          __END__
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'__END__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@drawable/ic_perf_launcher"
+                  android:label="Game CPU mode"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".PerformanceActivity"
+                      android:exported="true"
+                      android:label="Game CPU mode">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".PerformanceTileService"
+                      android:exported="true"
+                      android:icon="@drawable/ic_perf_tile"
+                      android:label="Game CPU mode"
+                      android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+                      <intent-filter>
+                          <action android:name="android.service.quicksettings.action.QS_TILE" />
+                      </intent-filter>
+                  </service>
+
+                  <service
+                      android:name=".FloatingBarService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="floating_shortcut_bar" />
+                  </service>
+              </application>
+          </manifest>
+          __END__
+          mkdir -p app/src/main/java/com/gamecpu/mode
+          cat > app/src/main/java/com/gamecpu/mode/CpuController.kt <<'__END__'
+          package com.gamecpu.mode
+
+          import java.io.File
+
+          /** อ่านและตั้งค่าความเร็ว CPU จริงผ่าน cpufreq ของเคอร์เนล (การตั้งค่าต้องใช้ root) */
+          object CpuController {
+
+              data class Cluster(
+                  val path: String,
+                  val cpus: String,
+                  val minKhz: Long,
+                  val maxKhz: Long,
+                  val curKhz: Long,
+                  val steps: List<Long>
+              )
+
+              private const val BASE = "/sys/devices/system/cpu/cpufreq"
+
+              private fun File.readLong(): Long? = try { readText().trim().toLong() } catch (e: Exception) { null }
+
+              fun readClusters(): List<Cluster> {
+                  val policies = File(BASE).listFiles { f -> f.name.startsWith("policy") }
+                      ?.sortedBy { it.name } ?: return emptyList()
+                  return policies.mapNotNull { p ->
+                      val hwMin = File(p, "cpuinfo_min_freq").readLong() ?: return@mapNotNull null
+                      val hwMax = File(p, "cpuinfo_max_freq").readLong() ?: return@mapNotNull null
+                      val cur = File(p, "scaling_cur_freq").readLong() ?: File(p, "cpuinfo_cur_freq").readLong() ?: 0L
+                      val steps = try {
+                          File(p, "scaling_available_frequencies").readText().trim()
+                              .split(Regex("\\s+")).mapNotNull { it.toLongOrNull() }.sorted()
+                      } catch (e: Exception) { emptyList() }
+                      val cpus = try { File(p, "related_cpus").readText().trim() } catch (e: Exception) { p.name }
+                      Cluster(p.absolutePath, cpus, hwMin, hwMax, cur, if (steps.isEmpty()) listOf(hwMin, hwMax) else steps)
+                  }
+              }
+
+              private fun su(cmd: String): Boolean = try {
+                  val proc = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
+                  proc.waitFor() == 0
+              } catch (e: Exception) { false }
+
+              fun hasRoot(): Boolean = su("id")
+
+              /** ตั้งเพดานความเร็ว (kHz) ได้เฉพาะค่าที่อยู่ในรายการความเร็วของ cluster นั้น */
+              fun setMaxFreq(cluster: Cluster, khz: Long): Boolean {
+                  if (khz !in cluster.steps) return false
+                  return su("echo $khz > ${cluster.path}/scaling_max_freq")
+              }
+
+              /** คืนค่าเริ่มต้นของเครื่อง */
+              fun reset(cluster: Cluster): Boolean =
+                  su("echo ${cluster.maxKhz} > ${cluster.path}/scaling_max_freq")
+
+              fun resetAll() = readClusters().forEach { reset(it) }
+          }
+          __END__
+          mkdir -p app/src/main/java/com/gamecpu/mode
+          cat > app/src/main/java/com/gamecpu/mode/FloatingBarService.kt <<'__END__'
+          package com.gamecpu.mode
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Build
+          import android.os.IBinder
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import kotlin.math.abs
+
+          /** แถบลอยเล็ก ๆ ที่ขอบจอขวา แตะเพื่อเปิดแผง Game CPU mode ลากขึ้นลงเพื่อย้ายตำแหน่ง */
+          class FloatingBarService : Service() {
+
+              companion object {
+                  @Volatile var running = false
+                  private const val CHANNEL = "ignis_bar"
+              }
+
+              private lateinit var wm: WindowManager
+              private var bar: View? = null
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  startAsForeground()
+                  addBar()
+                  running = true
+              }
+
+              private fun startAsForeground() {
+                  val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+                  nm.createNotificationChannel(
+                      NotificationChannel(CHANNEL, "Game CPU mode แถบลอย", NotificationManager.IMPORTANCE_MIN)
+                  )
+                  val n = Notification.Builder(this, CHANNEL)
+                      .setSmallIcon(R.drawable.ic_perf_tile)   // ถ้า R ขึ้นแดง ให้ import R ของแอป เช่น com.ignis.deck.R
+                      .setContentTitle("Game CPU mode: แถบลอยทำงานอยู่")
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  } else {
+                      startForeground(1, n)
+                  }
+              }
+
+              private fun addBar() {
+                  val d = resources.displayMetrics.density
+                  val v = View(this).apply {
+                      background = GradientDrawable().apply {
+                          setColor(0xCCFF3B30.toInt())
+                          cornerRadius = 7 * d
+                      }
+                  }
+                  val lp = WindowManager.LayoutParams(
+                      (14 * d).toInt(), (72 * d).toInt(),
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.END
+                      y = (300 * d).toInt()
+                  }
+
+                  var downY = 0f
+                  var startY = 0
+                  var moved = false
+                  v.setOnTouchListener { _, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> { downY = e.rawY; startY = lp.y; moved = false }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dy = e.rawY - downY
+                              if (abs(dy) > 10 * d) moved = true
+                              if (moved) { lp.y = (startY + dy).toInt().coerceAtLeast(0); wm.updateViewLayout(v, lp) }
+                          }
+                          MotionEvent.ACTION_UP -> if (!moved) {
+                              startActivity(
+                                  Intent(this, PerformanceActivity::class.java)
+                                      .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                              )
+                          }
+                      }
+                      true
+                  }
+                  wm.addView(v, lp)
+                  bar = v
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int) = START_STICKY
+
+              override fun onDestroy() {
+                  bar?.let { try { wm.removeView(it) } catch (e: Exception) {} }
+                  bar = null
+                  running = false
+                  super.onDestroy()
+              }
+          }
+          __END__
+          mkdir -p app/src/main/java/com/gamecpu/mode
+          cat > app/src/main/java/com/gamecpu/mode/PerformanceActivity.kt <<'__END__'
+          package com.gamecpu.mode
+
+          import android.app.Activity
+          import android.graphics.Color
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.*
+
+          /** แผง Game CPU mode: แสดงค่า CPU จริงทุกครั้ง และปรับได้เมื่อมี root เท่านั้น */
+          class PerformanceActivity : Activity() {
+
+              private var root = false
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val dp = resources.displayMetrics.density
+                  val pad = (16 * dp).toInt()
+
+                  val col = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad * 2, pad, pad)
+                      setBackgroundColor(Color.parseColor("#1C1C1E"))
+                  }
+                  fun label(text: String, size: Float = 14f, color: Int = Color.WHITE) =
+                      TextView(this).apply { this.text = text; textSize = size; setTextColor(color) }
+
+                  col.addView(label("Game CPU mode", 20f))
+                  val status = label("กำลังตรวจสอบสิทธิ์ root...", 13f, Color.parseColor("#AAAAAA"))
+                  col.addView(status)
+
+                  val master = Switch(this).apply {
+                      text = "Clock speed customization"; setTextColor(Color.WHITE); isEnabled = false
+                  }
+                  col.addView(master)
+
+                  val barSwitch = Switch(this).apply {
+                      text = "แถบลอยที่ขอบจอ (แตะเปิดแผงจากทุกหน้า)"; setTextColor(Color.WHITE)
+                      isChecked = FloatingBarService.running
+                  }
+                  barSwitch.setOnCheckedChangeListener { btn, on ->
+                      if (on) {
+                          if (!Settings.canDrawOverlays(this)) {
+                              btn.isChecked = false
+                              Toast.makeText(this, "เปิดสิทธิ์ \"แสดงทับแอปอื่น\" ให้ Ignis แล้วกลับมาเปิดสวิตช์อีกครั้ง", Toast.LENGTH_LONG).show()
+                              startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                          } else {
+                              startForegroundService(Intent(this, FloatingBarService::class.java))
+                          }
+                      } else {
+                          stopService(Intent(this, FloatingBarService::class.java))
+                      }
+                  }
+                  col.addView(barSwitch)
+
+                  val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  col.addView(list)
+
+                  val reset = Button(this).apply { text = "คืนค่าเริ่มต้น"; isEnabled = false }
+                  col.addView(reset)
+                  setContentView(ScrollView(this).apply { addView(col) })
+
+                  Thread {
+                      root = CpuController.hasRoot()
+                      val clusters = CpuController.readClusters()
+                      runOnUiThread {
+                          status.text = when {
+                              clusters.isEmpty() -> "อ่านค่า CPU จากเครื่องนี้ไม่ได้ (เคอร์เนลไม่เปิดให้อ่าน)"
+                              root -> "พบ root: ปรับความเร็วได้"
+                              else -> "ไม่พบ root: แสดงค่าจริงอย่างเดียว ปรับไม่ได้"
+                          }
+                          master.isEnabled = root
+                          reset.isEnabled = root
+                          clusters.forEachIndexed { i, c ->
+                              val title = label("Cluster ${i + 1} (CPU ${c.cpus})")
+                              val info = label("", 12f, Color.parseColor("#4CD964"))
+                              val bar = SeekBar(this).apply {
+                                  max = c.steps.size - 1
+                                  progress = c.steps.indexOfLast { it <= c.maxKhz }.coerceAtLeast(0)
+                                  isEnabled = false
+                              }
+                              fun show(k: Long) { info.text = "ปัจจุบัน ${c.curKhz / 1000} MHz | เพดาน ${k / 1000} MHz" }
+                              show(c.steps[bar.progress])
+                              bar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                                  override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                                      show(c.steps[p])
+                                      if (fromUser) Thread { CpuController.setMaxFreq(c, c.steps[p]) }.start()
+                                  }
+                                  override fun onStartTrackingTouch(s: SeekBar?) {}
+                                  override fun onStopTrackingTouch(s: SeekBar?) {}
+                              })
+                              master.setOnCheckedChangeListener { _, on ->
+                                  bar.isEnabled = on && root
+                                  if (!on) Thread { CpuController.reset(c) }.start()
+                              }
+                              list.addView(title); list.addView(bar); list.addView(info)
+                          }
+                          reset.setOnClickListener {
+                              Thread { CpuController.resetAll() }.start()
+                              Toast.makeText(this, "คืนค่าเริ่มต้นแล้ว", Toast.LENGTH_SHORT).show()
+                          }
+                      }
+                  }.start()
+              }
+          }
+          __END__
+          mkdir -p app/src/main/java/com/gamecpu/mode
+          cat > app/src/main/java/com/gamecpu/mode/PerformanceTileService.kt <<'__END__'
+          package com.gamecpu.mode
+
+          import android.app.PendingIntent
+          import android.content.Intent
+          import android.os.Build
+          import android.service.quicksettings.Tile
+          import android.service.quicksettings.TileService
+
+          /** ปุ่มลัด "Game CPU mode" ในแผงปุ่มลัด กดแล้วเปิดแผงปรับความเร็ว */
+          class PerformanceTileService : TileService() {
+
+              override fun onStartListening() {
+                  qsTile?.apply { state = Tile.STATE_INACTIVE; label = "Game CPU mode"; updateTile() }
+              }
+
+              override fun onClick() {
+                  val intent = Intent(this, PerformanceActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      val pi = PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_IMMUTABLE)
+                      startActivityAndCollapse(pi)
+                  } else {
+                      @Suppress("DEPRECATION")
+                      startActivityAndCollapse(intent)
+                  }
+              }
+          }
+          __END__
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_perf_launcher.xml <<'__END__'
+          <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+              <item>
+                  <shape android:shape="oval"><solid android:color="#FF3B30"/></shape>
+              </item>
+              <item android:drawable="@drawable/ic_perf_tile" android:top="14dp" android:bottom="14dp" android:left="14dp" android:right="14dp"/>
+          </layer-list>
+          __END__
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_perf_tile.xml <<'__END__'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFFFF"
+                  android:pathData="M13,2L3,14h7l-1,8 10,-12h-7z"/>
+          </vector>
+          __END__
+          cat > build.gradle.kts <<'__END__'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          __END__
+          cat > gradle.properties <<'__END__'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          __END__
+          cat > settings.gradle.kts <<'__END__'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "GameCPUmode"
+          include(":app")
+          __END__
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8
