@@ -448,13 +448,3 @@ jobs:
         with:
           name: GameCPUmode-apk
           path: app/build/outputs/apk/debug/*.apk
-// ตัวอย่างคำสั่งที่คุณต้องการส่งไปสั่งระบบ (เช่น คำสั่งปรับความเร็ว CPU)
-val shellCommand = "echo 1958000 > /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq"
-
-try {
-    // สั่งรันผ่าน Shizuku แทนคำสั่ง su (Root)
-    val process = Shizuku.newProcess(arrayOf("sh", "-c", shellCommand), null, null)
-    process.waitFor()
-} catch (e: Exception) {
-    e.printStackTrace()
-}
