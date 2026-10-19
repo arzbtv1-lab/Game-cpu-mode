@@ -289,8 +289,7 @@ jobs:
                       text = "Clock speed customization"; setTextColor(Color.WHITE); isEnabled = false
                   }
                   col.addView(master)
-      barSwitch = Switch(this).apply {
-                      text = "แถบลอยที่ขอบจอ (แตะเปิดแผงจากทุกหน้า)"; setTextColor(Color.WHITE)
+                          text = "แถบลอยที่ขอบจอ (แตะเปิดแผงจากทุกหน้า)"; setTextColor(Color.WHITE)
                       isChecked = FloatingBarService.running
                   }
                   barSwitch.setOnCheckedChangeListener { btn, on ->
