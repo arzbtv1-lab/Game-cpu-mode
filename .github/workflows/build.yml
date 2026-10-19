@@ -448,4 +448,3 @@ jobs:
         with:
           name: GameCPUmode-apk
           path: app/build/outputs/apk/debug/*.apk
-Shizuku.requestPermission(1001)
