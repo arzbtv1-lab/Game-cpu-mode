@@ -35,16 +35,21 @@ jobs:
                   jvmTarget = "17"
               }
           }
+
+          dependencies {
+              implementation("dev.rikka.shizuku:api:13.1.5")
+              implementation("dev.rikka.shizuku:provider:13.1.5")
+          }
           __END__
           mkdir -p app/src/main
           cat > app/src/main/AndroidManifest.xml <<'__END__'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
-              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />
+              <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+              <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
 
               <application
                   android:allowBackup="true"
@@ -73,14 +78,13 @@ jobs:
                       </intent-filter>
                   </service>
 
-                  <service
-                      android:name=".FloatingBarService"
-                      android:exported="false"
-                      android:foregroundServiceType="specialUse">
-                      <property
-                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                          android:value="floating_shortcut_bar" />
-                  </service>
+                  <provider
+                      android:name="rikka.shizuku.ShizukuProvider"
+                      android:authorities="${applicationId}.shizuku"
+                      android:enabled="true"
+                      android:exported="true"
+                      android:multiprocess="false"
+                      android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
               </application>
           </manifest>
           __END__
@@ -90,7 +94,7 @@ jobs:
 
           import java.io.File
 
-          /** อ่านและตั้งค่าความเร็ว CPU จริงผ่าน cpufreq ของเคอร์เนล (การตั้งค่าต้องใช้ root) */
+          /** อ่านและตั้งค่าความเร็ว CPU ผ่าน cpufreq ของเคอร์เนล (การตั้งค่าต้องใช้ root หรือ Shizuku ที่ได้รับอนุญาตเขียน) */
           object CpuController {
 
               data class Cluster(
@@ -129,125 +133,105 @@ jobs:
 
               fun hasRoot(): Boolean = su("id")
 
+              /** ลอง root ก่อน ถ้าไม่ได้ลองผ่าน Shizuku */
+              private fun run(cmd: String): Boolean {
+                  if (su(cmd)) return true
+                  if (!Shell.available()) return false
+                  val out = Shell.run("$cmd 2>&1; echo EXIT=\$?") ?: return false
+                  return out.contains("EXIT=0")
+              }
+
+              /**
+               * ทดสอบว่า Shizuku เขียนไฟล์ควบคุมความเร็ว CPU ได้ไหม โดยเขียนค่าเดิมกลับเข้าไป (ไม่เปลี่ยนความเร็วจริง)
+               * คืนค่า (ผ่านไหม, ข้อความผล)
+               */
+              fun testWriteViaShizuku(): Pair<Boolean, String> {
+                  if (!Shell.available()) return false to "Shizuku ไม่ทำงาน หรือยังไม่ได้อนุญาตแอปนี้"
+                  val c = readClusters().firstOrNull() ?: return false to "อ่านค่า CPU ไม่ได้"
+                  val p = c.path
+                  val out = Shell.run("v=\$(cat $p/scaling_max_freq); echo \"\$v\" > $p/scaling_max_freq 2>&1; echo EXIT=\$?")
+                      ?: return false to "สั่งคำสั่งผ่าน Shizuku ไม่ได้"
+                  return if (out.contains("EXIT=0")) {
+                      true to "เขียนค่าได้"
+                  } else {
+                      false to (out.lines().firstOrNull { it.isNotBlank() && !it.startsWith("EXIT") } ?: "ถูกปฏิเสธ")
+                  }
+              }
+
+              fun canAdjust(): Boolean = hasRoot() || testWriteViaShizuku().first
+
               /** ตั้งเพดานความเร็ว (kHz) ได้เฉพาะค่าที่อยู่ในรายการความเร็วของ cluster นั้น */
               fun setMaxFreq(cluster: Cluster, khz: Long): Boolean {
                   if (khz !in cluster.steps) return false
-                  return su("echo $khz > ${cluster.path}/scaling_max_freq")
+                  return run("echo $khz > ${cluster.path}/scaling_max_freq")
               }
 
-              /** คืนค่าเริ่มต้นของเครื่อง */
               fun reset(cluster: Cluster): Boolean =
-                  su("echo ${cluster.maxKhz} > ${cluster.path}/scaling_max_freq")
+                  run("echo ${cluster.maxKhz} > ${cluster.path}/scaling_max_freq")
 
               fun resetAll() = readClusters().forEach { reset(it) }
           }
           __END__
           mkdir -p app/src/main/java/com/gamecpu/mode
-          cat > app/src/main/java/com/gamecpu/mode/FloatingBarService.kt <<'__END__'
+          cat > app/src/main/java/com/gamecpu/mode/GameMode.kt <<'__END__'
           package com.gamecpu.mode
 
-          import android.app.Notification
-          import android.app.NotificationChannel
+          import android.app.ActivityManager
           import android.app.NotificationManager
-          import android.app.Service
-          import android.content.Intent
-          import android.content.pm.ServiceInfo
-          import android.graphics.PixelFormat
-          import android.graphics.drawable.GradientDrawable
-          import android.os.Build
-          import android.os.IBinder
-          import android.view.Gravity
-          import android.view.MotionEvent
-          import android.view.View
-          import android.view.WindowManager
-          import kotlin.math.abs
+          import android.content.Context
+          import android.content.pm.ApplicationInfo
 
-          /** แถบลอยเล็ก ๆ ที่ขอบจอขวา แตะเพื่อเปิดแผง Game CPU mode ลากขึ้นลงเพื่อย้ายตำแหน่ง */
-          class FloatingBarService : Service() {
+          /** Game Mode: เปิดห้ามรบกวน + ล้างแอปพื้นหลัง (ทำได้จริงโดยไม่ต้อง root) */
+          object GameMode {
+              private const val PREFS = "game_mode"
+              private val keep = setOf("moe.shizuku.privileged.api")
 
-              companion object {
-                  @Volatile var running = false
-                  private const val CHANNEL = "ignis_bar"
+              private fun nm(ctx: Context) = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+              fun isOn(ctx: Context): Boolean =
+                  ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean("on", false)
+
+              fun hasPolicyAccess(ctx: Context): Boolean = nm(ctx).isNotificationPolicyAccessGranted
+
+              fun freeRamMb(ctx: Context): Long {
+                  val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+                  val info = ActivityManager.MemoryInfo()
+                  am.getMemoryInfo(info)
+                  return info.availMem / (1024 * 1024)
               }
 
-              private lateinit var wm: WindowManager
-              private var bar: View? = null
-
-              override fun onBind(intent: Intent?): IBinder? = null
-
-              override fun onCreate() {
-                  super.onCreate()
-                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
-                  startAsForeground()
-                  addBar()
-                  running = true
+              /** ขอให้ระบบปิดโปรเซสพื้นหลังของแอปที่ผู้ใช้ติดตั้ง (ระบบอาจเปิดบางตัวกลับมาเอง) */
+              fun clearBackground(ctx: Context): Int {
+                  val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+                  var n = 0
+                  for (app in ctx.packageManager.getInstalledApplications(0)) {
+                      if ((app.flags and ApplicationInfo.FLAG_SYSTEM) != 0) continue
+                      if (app.packageName == ctx.packageName || app.packageName in keep) continue
+                      am.killBackgroundProcesses(app.packageName)
+                      n++
+                  }
+                  return n
               }
 
-              private fun startAsForeground() {
-                  val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-                  nm.createNotificationChannel(
-                      NotificationChannel(CHANNEL, "Game CPU mode แถบลอย", NotificationManager.IMPORTANCE_MIN)
-                  )
-                  val n = Notification.Builder(this, CHANNEL)
-                      .setSmallIcon(R.drawable.ic_perf_tile)   // ถ้า R ขึ้นแดง ให้ import R ของแอป เช่น com.ignis.deck.R
-                      .setContentTitle("Game CPU mode: แถบลอยทำงานอยู่")
-                      .build()
-                  if (Build.VERSION.SDK_INT >= 34) {
-                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-                  } else {
-                      startForeground(1, n)
-                  }
+              /** คืนจำนวนแอปที่สั่งปิดพื้นหลัง */
+              fun enable(ctx: Context): Int {
+                  val n = nm(ctx)
+                  ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                      .putInt("prev_filter", n.currentInterruptionFilter)
+                      .putBoolean("on", true).apply()
+                  n.setInterruptionFilter(NotificationManager.INTERRUPTION_FILTER_PRIORITY)
+                  return clearBackground(ctx)
               }
 
-              private fun addBar() {
-                  val d = resources.displayMetrics.density
-                  val v = View(this).apply {
-                      background = GradientDrawable().apply {
-                          setColor(0xCCFF3B30.toInt())
-                          cornerRadius = 7 * d
-                      }
+              fun disable(ctx: Context) {
+                  val p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                  if (hasPolicyAccess(ctx)) {
+                      val prev = p.getInt("prev_filter", NotificationManager.INTERRUPTION_FILTER_ALL)
+                      nm(ctx).setInterruptionFilter(
+                          if (prev == NotificationManager.INTERRUPTION_FILTER_UNKNOWN) NotificationManager.INTERRUPTION_FILTER_ALL else prev
+                      )
                   }
-                  val lp = WindowManager.LayoutParams(
-                      (14 * d).toInt(), (72 * d).toInt(),
-                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-                      PixelFormat.TRANSLUCENT
-                  ).apply {
-                      gravity = Gravity.TOP or Gravity.END
-                      y = (300 * d).toInt()
-                  }
-
-                  var downY = 0f
-                  var startY = 0
-                  var moved = false
-                  v.setOnTouchListener { _, e ->
-                      when (e.action) {
-                          MotionEvent.ACTION_DOWN -> { downY = e.rawY; startY = lp.y; moved = false }
-                          MotionEvent.ACTION_MOVE -> {
-                              val dy = e.rawY - downY
-                              if (abs(dy) > 10 * d) moved = true
-                              if (moved) { lp.y = (startY + dy).toInt().coerceAtLeast(0); wm.updateViewLayout(v, lp) }
-                          }
-                          MotionEvent.ACTION_UP -> if (!moved) {
-                              startActivity(
-                                  Intent(this, PerformanceActivity::class.java)
-                                      .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                              )
-                          }
-                      }
-                      true
-                  }
-                  wm.addView(v, lp)
-                  bar = v
-              }
-
-              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int) = START_STICKY
-
-              override fun onDestroy() {
-                  bar?.let { try { wm.removeView(it) } catch (e: Exception) {} }
-                  bar = null
-                  running = false
-                  super.onDestroy()
+                  p.edit().putBoolean("on", false).apply()
               }
           }
           __END__
@@ -256,22 +240,40 @@ jobs:
           package com.gamecpu.mode
 
           import android.app.Activity
-          import android.graphics.Color
           import android.content.Intent
-          import android.net.Uri
+          import android.content.pm.ApplicationInfo
+          import android.content.pm.PackageManager
+          import android.graphics.Color
           import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
           import android.provider.Settings
           import android.widget.*
+          import rikka.shizuku.Shizuku
 
-          /** แผง Game CPU mode: แสดงค่า CPU จริงทุกครั้ง และปรับได้เมื่อมี root เท่านั้น */
+          /** หน้าหลัก Game CPU mode: เปิดเกม + Game Mode, ปรับ CPU (ถ้าได้สิทธิ์), เชื่อม Shizuku */
           class PerformanceActivity : Activity() {
 
-              private var root = false
+              private var canAdjust = false
+              private var gameSwitch: Switch? = null
+              private var gameListener: CompoundButton.OnCheckedChangeListener? = null
+
+              override fun onResume() {
+                  super.onResume()
+                  gameSwitch?.let { s ->
+                      s.setOnCheckedChangeListener(null)
+                      s.isChecked = GameMode.isOn(this)
+                      s.setOnCheckedChangeListener(gameListener)
+                  }
+              }
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
                   val dp = resources.displayMetrics.density
                   val pad = (16 * dp).toInt()
+                  val prefs = getSharedPreferences("ui", MODE_PRIVATE)
+                  val green = Color.parseColor("#4CD964")
+                  val grey = Color.parseColor("#AAAAAA")
 
                   val col = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
@@ -280,176 +282,130 @@ jobs:
                   }
                   fun label(text: String, size: Float = 14f, color: Int = Color.WHITE) =
                       TextView(this).apply { this.text = text; textSize = size; setTextColor(color) }
+                  fun section(text: String) =
+                      label(text, 16f).apply { setPadding(0, (20 * dp).toInt(), 0, 0) }
 
                   col.addView(label("Game CPU mode", 20f))
-                  val status = label("กำลังตรวจสอบสิทธิ์ root...", 13f, Color.parseColor("#AAAAAA"))
+                  val status = label("กำลังตรวจสอบสิทธิ์...", 13f, grey)
                   col.addView(status)
 
+                  // ---------- เปิดเกม ----------
+                  col.addView(section("เปิดเกม"))
+                  val pm = packageManager
+                  val games = pm.getInstalledApplications(0)
+                      .filter {
+                          (it.flags and ApplicationInfo.FLAG_SYSTEM) == 0 &&
+                              it.packageName != packageName &&
+                              pm.getLaunchIntentForPackage(it.packageName) != null
+                      }
+                      .sortedBy { pm.getApplicationLabel(it).toString().lowercase() }
+                  val spinner = Spinner(this)
+                  spinner.adapter = ArrayAdapter(
+                      this, android.R.layout.simple_spinner_dropdown_item,
+                      games.map { pm.getApplicationLabel(it).toString() }
+                  )
+                  val saved = prefs.getString("game_pkg", "com.roblox.client")
+                  val idx = games.indexOfFirst { it.packageName == saved }
+                  if (idx >= 0) spinner.setSelection(idx)
+                  col.addView(spinner)
+
+                  val launchBtn = Button(this).apply { text = "เปิดเกม + Game Mode" }
+                  launchBtn.setOnClickListener {
+                      if (games.isEmpty()) return@setOnClickListener
+                      val app = games[spinner.selectedItemPosition]
+                      prefs.edit().putString("game_pkg", app.packageName).apply()
+                      if (GameMode.hasPolicyAccess(this)) {
+                          if (!GameMode.isOn(this)) GameMode.enable(this) else GameMode.clearBackground(this)
+                      } else {
+                          GameMode.clearBackground(this)
+                          Toast.makeText(this, "ยังไม่ได้ให้สิทธิ์ห้ามรบกวน จึงล้างแรมอย่างเดียว", Toast.LENGTH_LONG).show()
+                      }
+                      pm.getLaunchIntentForPackage(app.packageName)?.let { startActivity(it) }
+                  }
+                  col.addView(launchBtn)
+
+                  // ---------- Game Mode ----------
+                  col.addView(section("Game Mode"))
+                  val gs = Switch(this).apply {
+                      text = "ห้ามรบกวน + ล้างแอปพื้นหลัง"; setTextColor(Color.WHITE)
+                      isChecked = GameMode.isOn(this@PerformanceActivity)
+                  }
+                  val ramText = label("แรมว่างตอนนี้ ${GameMode.freeRamMb(this)} MB", 12f, green)
+                  gameListener = CompoundButton.OnCheckedChangeListener { btn, on ->
+                      if (on) {
+                          if (!GameMode.hasPolicyAccess(this)) {
+                              btn.isChecked = false
+                              Toast.makeText(this, "เปิดสิทธิ์ \"ห้ามรบกวน\" ให้ Game CPU mode แล้วกลับมาเปิดสวิตช์อีกครั้ง", Toast.LENGTH_LONG).show()
+                              startActivity(Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS))
+                          } else if (!GameMode.isOn(this)) {
+                              val before = GameMode.freeRamMb(this)
+                              val n = GameMode.enable(this)
+                              Handler(Looper.getMainLooper()).postDelayed({
+                                  ramText.text = "สั่งปิดพื้นหลัง $n แอป | แรมว่าง $before → ${GameMode.freeRamMb(this)} MB"
+                              }, 1500)
+                          }
+                      } else if (GameMode.isOn(this)) {
+                          GameMode.disable(this)
+                      }
+                  }
+                  gs.setOnCheckedChangeListener(gameListener)
+                  gameSwitch = gs
+                  col.addView(gs)
+                  col.addView(ramText)
+
+                  // ---------- ปรับความเร็ว CPU ----------
+                  col.addView(section("ความเร็ว CPU"))
                   val master = Switch(this).apply {
                       text = "Clock speed customization"; setTextColor(Color.WHITE); isEnabled = false
                   }
-                  master.setOnCheckedChangeListener { _, isChecked ->
-    if (isChecked) {
-        try {
-            Shizuku.newProcess(arrayOf("sh", "-c", "echo 1958000 > /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq"), null, null).waitFor()
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-    }
-}                      text = "แถบลอยที่ขอบจอ (แตะเปิดแผงจากทุกหน้า)"; setTextColor(Color.WHITE)
-                      isChecked = FloatingBarService.running
-                  }
-                  barSwitch.setOnCheckedChangeListener { btn, on ->
-                      if (on) {
-                          if (!Settings.canDrawOverlays(this)) {
-                              btn.isChecked = false
-                              Toast.makeText(this, "เปิดสิทธิ์ \"แสดงทับแอปอื่น\" ให้ Ignis แล้วกลับมาเปิดสวิตช์อีกครั้ง", Toast.LENGTH_LONG).show()
-                              startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
-                          } else {
-                              startForegroundService(Intent(this, FloatingBarService::class.java))
-                          }
-                      } else {
-                          stopService(Intent(this, FloatingBarService::class.java))
-                      }
-                  }
-                  col.addView(barSwitch)
-
+                  col.addView(master)
                   val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
                   col.addView(list)
-
                   val reset = Button(this).apply { text = "คืนค่าเริ่มต้น"; isEnabled = false }
                   col.addView(reset)
-                  setContentView(ScrollView(this).apply { addView(col) })
 
-                  Thread {
-                      root = CpuController.hasRoot()
-                      val clusters = CpuController.readClusters()
-                      runOnUiThread {
-                          status.text = when {
-                              clusters.isEmpty() -> "อ่านค่า CPU จากเครื่องนี้ไม่ได้ (เคอร์เนลไม่เปิดให้อ่าน)"
-                              root -> "พบ root: ปรับความเร็วได้"
-                              else -> "ไม่พบ root: แสดงค่าจริงอย่างเดียว ปรับไม่ได้"
+                  // ---------- Shizuku ----------
+                  col.addView(section("Shizuku"))
+                  val shizukuText = label("", 12f, grey)
+                  val shizukuBtn = Button(this).apply { text = "เชื่อม Shizuku" }
+                  val testBtn = Button(this).apply { text = "ทดสอบสั่งปรับ CPU ผ่าน Shizuku" }
+                  fun refreshShizuku() {
+                      shizukuText.text = try {
+                          when {
+                              !Shizuku.pingBinder() -> "Shizuku: ไม่ทำงาน (เปิดแอป Shizuku แล้วกดเริ่มก่อน)"
+                              Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED -> "Shizuku: เชื่อมแล้ว"
+                              else -> "Shizuku: ทำงานอยู่ แต่ยังไม่ได้อนุญาตแอปนี้ กดปุ่มเชื่อม"
                           }
-                          master.isEnabled = root
-                          reset.isEnabled = root
-                          clusters.forEachIndexed { i, c ->
-                              val title = label("Cluster ${i + 1} (CPU ${c.cpus})")
-                              val info = label("", 12f, Color.parseColor("#4CD964"))
-                              val bar = SeekBar(this).apply {
-                                  max = c.steps.size - 1
-                                  progress = c.steps.indexOfLast { it <= c.maxKhz }.coerceAtLeast(0)
-                                  isEnabled = false
-                              }
-                              fun show(k: Long) { info.text = "ปัจจุบัน ${c.curKhz / 1000} MHz | เพดาน ${k / 1000} MHz" }
-                              show(c.steps[bar.progress])
-                              bar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                                  override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
-                                      show(c.steps[p])
-                                      if (fromUser) Thread { CpuController.setMaxFreq(c, c.steps[p]) }.start()
-                                  }
-                                  override fun onStartTrackingTouch(s: SeekBar?) {}
-                                  override fun onStopTrackingTouch(s: SeekBar?) {}
-                              })
-                              master.setOnCheckedChangeListener { _, on ->
-                                  bar.isEnabled = on && root
-                                  if (!on) Thread { CpuController.reset(c) }.start()
-                              }
-                              list.addView(title); list.addView(bar); list.addView(info)
-                          }
-                          reset.setOnClickListener {
-                              Thread { CpuController.resetAll() }.start()
-                              Toast.makeText(this, "คืนค่าเริ่มต้นแล้ว", Toast.LENGTH_SHORT).show()
-                          }
-                      }
-                  }.start()
-              }
-          }
-          __END__
-          mkdir -p app/src/main/java/com/gamecpu/mode
-          cat > app/src/main/java/com/gamecpu/mode/PerformanceTileService.kt <<'__END__'
-          package com.gamecpu.mode
-
-          import android.app.PendingIntent
-          import android.content.Intent
-          import android.os.Build
-          import android.service.quicksettings.Tile
-          import android.service.quicksettings.TileService
-
-          /** ปุ่มลัด "Game CPU mode" ในแผงปุ่มลัด กดแล้วเปิดแผงปรับความเร็ว */
-          class PerformanceTileService : TileService() {
-
-              override fun onStartListening() {
-                  qsTile?.apply { state = Tile.STATE_INACTIVE; label = "Game CPU mode"; updateTile() }
-              }
-
-              override fun onClick() {
-                  val intent = Intent(this, PerformanceActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                  if (Build.VERSION.SDK_INT >= 34) {
-                      val pi = PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_IMMUTABLE)
-                      startActivityAndCollapse(pi)
-                  } else {
-                      @Suppress("DEPRECATION")
-                      startActivityAndCollapse(intent)
+                      } catch (e: Throwable) { "Shizuku: ตรวจสอบไม่ได้" }
                   }
-              }
-          }
-          __END__
-          mkdir -p app/src/main/res/drawable
-          cat > app/src/main/res/drawable/ic_perf_launcher.xml <<'__END__'
-          <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
-              <item>
-                  <shape android:shape="oval"><solid android:color="#FF3B30"/></shape>
-              </item>
-              <item android:drawable="@drawable/ic_perf_tile" android:top="14dp" android:bottom="14dp" android:left="14dp" android:right="14dp"/>
-          </layer-list>
-          __END__
-          mkdir -p app/src/main/res/drawable
-          cat > app/src/main/res/drawable/ic_perf_tile.xml <<'__END__'
-          <vector xmlns:android="http://schemas.android.com/apk/res/android"
-              android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
-              <path android:fillColor="#FFFFFFFF"
-                  android:pathData="M13,2L3,14h7l-1,8 10,-12h-7z"/>
-          </vector>
-          __END__
-          cat > build.gradle.kts <<'__END__'
-          plugins {
-              id("com.android.application") version "8.5.2" apply false
-              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
-          }
-          __END__
-          cat > gradle.properties <<'__END__'
-          org.gradle.jvmargs=-Xmx2g
-          android.useAndroidX=true
-          android.nonTransitiveRClass=true
-          __END__
-          cat > settings.gradle.kts <<'__END__'
-          pluginManagement {
-              repositories {
-                  google()
-                  mavenCentral()
-                  gradlePluginPortal()
-              }
-          }
-          dependencyResolutionManagement {
-              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
-              repositories {
-                  google()
-                  mavenCentral()
-              }
-          }
-          rootProject.name = "GameCPUmode"
-          include(":app")
-          __END__
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
-      - uses: gradle/actions/setup-gradle@v4
-        with:
-                    gradle-version: "8.9"
-      - name: Build debug APK
-        run: gradle assembleDebug --no-daemon
-      - uses: actions/upload-artifact@v4
-        with:
-          name: GameCPUmode-apk
-          path: app/build/outputs/apk/debug/*.apk
+                  shizukuBtn.setOnClickListener {
+                      try {
+                          if (!Shizuku.pingBinder()) {
+                              Toast.makeText(this, "เปิดแอป Shizuku แล้วกดเริ่มก่อน", Toast.LENGTH_LONG).show()
+                          } else if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
+                              Shizuku.requestPermission(1001)
+                          }
+                      } catch (e: Throwable) {
+                          Toast.makeText(this, "เชื่อม Shizuku ไม่ได้", Toast.LENGTH_LONG).show()
+                      }
+                      refreshShizuku()
+                  }
+                  testBtn.setOnClickListener {
+                      Thread {
+                          val (ok, msg) = CpuController.testWriteViaShizuku()
+                          runOnUiThread {
+                              Toast.makeText(
+                                  this,
+                                  (if (ok) "ทดสอบผ่าน: " else "ทดสอบไม่ผ่าน: ") + msg,
+                                  Toast.LENGTH_LONG
+                              ).show()
+                              shizukuText.text = (if (ok) "ผลทดสอบ: ผ่าน (" else "ผลทดสอบ: ไม่ผ่าน (") + msg + ")"
+                              if (ok) recreate()
+                          }
+                      }.start()
+                  }
+                  try {
+                      Shizuku.addRequestPermissionResultListener { _, _ -> runOnUiThread { refreshShizuku() } }
+                  } catch (e: Throwable) { }
+                  refreshShizuku()
+                  col.addV
