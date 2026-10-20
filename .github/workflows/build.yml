@@ -7,405 +7,149 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Create project files
-        run: |
-          mkdir -p app
-          cat > app/build.gradle.kts <<'__END__'
-          plugins {
-              id("com.android.application")
-              id("org.jetbrains.kotlin.android")
-          }
-
-          android {
-              namespace = "com.gamecpu.mode"
-              compileSdk = 34
-
-              defaultConfig {
-                  applicationId = "com.gamecpu.mode"
-                  minSdk = 26
-                  targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0"
-              }
-
-              compileOptions {
-                  sourceCompatibility = JavaVersion.VERSION_17
-                  targetCompatibility = JavaVersion.VERSION_17
-              }
-              kotlinOptions {
-                  jvmTarget = "17"
-              }
-          }
-
-          dependencies {
-              implementation("dev.rikka.shizuku:api:13.1.5")
-              implementation("dev.rikka.shizuku:provider:13.1.5")
-          }
-          __END__
-          mkdir -p app/src/main
-          cat > app/src/main/AndroidManifest.xml <<'__END__'
-          <?xml version="1.0" encoding="utf-8"?>
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-
-              <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />
-              <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
-              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
-              <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
-
-              <application
-                  android:allowBackup="true"
-                  android:icon="@drawable/ic_perf_launcher"
-                  android:label="Game CPU mode"
-                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
-
-                  <activity
-                      android:name=".PerformanceActivity"
-                      android:exported="true"
-                      android:label="Game CPU mode">
-                      <intent-filter>
-                          <action android:name="android.intent.action.MAIN" />
-                          <category android:name="android.intent.category.LAUNCHER" />
-                      </intent-filter>
-                  </activity>
-
-                  <service
-                      android:name=".PerformanceTileService"
-                      android:exported="true"
-                      android:icon="@drawable/ic_perf_tile"
-                      android:label="Game CPU mode"
-                      android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
-                      <intent-filter>
-                          <action android:name="android.service.quicksettings.action.QS_TILE" />
-                      </intent-filter>
-                  </service>
-
-                  <provider
-                      android:name="rikka.shizuku.ShizukuProvider"
-                      android:authorities="${applicationId}.shizuku"
-                      android:enabled="true"
-                      android:exported="true"
-                      android:multiprocess="false"
-                      android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
-              </application>
-          </manifest>
-          __END__
-          mkdir -p app/src/main/java/com/gamecpu/mode
-          cat > app/src/main/java/com/gamecpu/mode/CpuController.kt <<'__END__'
-          package com.gamecpu.mode
-
-          import java.io.File
-
-          /** อ่านและตั้งค่าความเร็ว CPU ผ่าน cpufreq ของเคอร์เนล (การตั้งค่าต้องใช้ root หรือ Shizuku ที่ได้รับอนุญาตเขียน) */
-          object CpuController {
-
-              data class Cluster(
-                  val path: String,
-                  val cpus: String,
-                  val minKhz: Long,
-                  val maxKhz: Long,
-                  val curKhz: Long,
-                  val steps: List<Long>
-              )
-
-              private const val BASE = "/sys/devices/system/cpu/cpufreq"
-
-              private fun File.readLong(): Long? = try { readText().trim().toLong() } catch (e: Exception) { null }
-
-              fun readClusters(): List<Cluster> {
-                  val policies = File(BASE).listFiles { f -> f.name.startsWith("policy") }
-                      ?.sortedBy { it.name } ?: return emptyList()
-                  return policies.mapNotNull { p ->
-                      val hwMin = File(p, "cpuinfo_min_freq").readLong() ?: return@mapNotNull null
-                      val hwMax = File(p, "cpuinfo_max_freq").readLong() ?: return@mapNotNull null
-                      val cur = File(p, "scaling_cur_freq").readLong() ?: File(p, "cpuinfo_cur_freq").readLong() ?: 0L
-                      val steps = try {
-                          File(p, "scaling_available_frequencies").readText().trim()
-                              .split(Regex("\\s+")).mapNotNull { it.toLongOrNull() }.sorted()
-                      } catch (e: Exception) { emptyList() }
-                      val cpus = try { File(p, "related_cpus").readText().trim() } catch (e: Exception) { p.name }
-                      Cluster(p.absolutePath, cpus, hwMin, hwMax, cur, if (steps.isEmpty()) listOf(hwMin, hwMax) else steps)
-                  }
-              }
-
-              private fun su(cmd: String): Boolean = try {
-                  val proc = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
-                  proc.waitFor() == 0
-              } catch (e: Exception) { false }
-
-              fun hasRoot(): Boolean = su("id")
-
-              /** ลอง root ก่อน ถ้าไม่ได้ลองผ่าน Shizuku */
-              private fun run(cmd: String): Boolean {
-                  if (su(cmd)) return true
-                  if (!Shell.available()) return false
-                  val out = Shell.run("$cmd 2>&1; echo EXIT=\$?") ?: return false
-                  return out.contains("EXIT=0")
-              }
-
-              /**
-               * ทดสอบว่า Shizuku เขียนไฟล์ควบคุมความเร็ว CPU ได้ไหม โดยเขียนค่าเดิมกลับเข้าไป (ไม่เปลี่ยนความเร็วจริง)
-               * คืนค่า (ผ่านไหม, ข้อความผล)
-               */
-              fun testWriteViaShizuku(): Pair<Boolean, String> {
-                  if (!Shell.available()) return false to "Shizuku ไม่ทำงาน หรือยังไม่ได้อนุญาตแอปนี้"
-                  val c = readClusters().firstOrNull() ?: return false to "อ่านค่า CPU ไม่ได้"
-                  val p = c.path
-                  val out = Shell.run("v=\$(cat $p/scaling_max_freq); echo \"\$v\" > $p/scaling_max_freq 2>&1; echo EXIT=\$?")
-                      ?: return false to "สั่งคำสั่งผ่าน Shizuku ไม่ได้"
-                  return if (out.contains("EXIT=0")) {
-                      true to "เขียนค่าได้"
-                  } else {
-                      false to (out.lines().firstOrNull { it.isNotBlank() && !it.startsWith("EXIT") } ?: "ถูกปฏิเสธ")
-                  }
-              }
-
-              fun canAdjust(): Boolean = hasRoot() || testWriteViaShizuku().first
-
-              /** ตั้งเพดานความเร็ว (kHz) ได้เฉพาะค่าที่อยู่ในรายการความเร็วของ cluster นั้น */
-              fun setMaxFreq(cluster: Cluster, khz: Long): Boolean {
-                  if (khz !in cluster.steps) return false
-                  return run("echo $khz > ${cluster.path}/scaling_max_freq")
-              }
-
-              fun reset(cluster: Cluster): Boolean =
-                  run("echo ${cluster.maxKhz} > ${cluster.path}/scaling_max_freq")
-
-              fun resetAll() = readClusters().forEach { reset(it) }
-          }
-          __END__
-          mkdir -p app/src/main/java/com/gamecpu/mode
-          cat > app/src/main/java/com/gamecpu/mode/GameMode.kt <<'__END__'
-          package com.gamecpu.mode
-
-          import android.app.ActivityManager
-          import android.app.NotificationManager
-          import android.content.Context
-          import android.content.pm.ApplicationInfo
-
-          /** Game Mode: เปิดห้ามรบกวน + ล้างแอปพื้นหลัง (ทำได้จริงโดยไม่ต้อง root) */
-          object GameMode {
-              private const val PREFS = "game_mode"
-              private val keep = setOf("moe.shizuku.privileged.api")
-
-              private fun nm(ctx: Context) = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-
-              fun isOn(ctx: Context): Boolean =
-                  ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean("on", false)
-
-              fun hasPolicyAccess(ctx: Context): Boolean = nm(ctx).isNotificationPolicyAccessGranted
-
-              fun freeRamMb(ctx: Context): Long {
-                  val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-                  val info = ActivityManager.MemoryInfo()
-                  am.getMemoryInfo(info)
-                  return info.availMem / (1024 * 1024)
-              }
-
-              /** ขอให้ระบบปิดโปรเซสพื้นหลังของแอปที่ผู้ใช้ติดตั้ง (ระบบอาจเปิดบางตัวกลับมาเอง) */
-              fun clearBackground(ctx: Context): Int {
-                  val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-                  var n = 0
-                  for (app in ctx.packageManager.getInstalledApplications(0)) {
-                      if ((app.flags and ApplicationInfo.FLAG_SYSTEM) != 0) continue
-                      if (app.packageName == ctx.packageName || app.packageName in keep) continue
-                      am.killBackgroundProcesses(app.packageName)
-                      n++
-                  }
-                  return n
-              }
-
-              /** คืนจำนวนแอปที่สั่งปิดพื้นหลัง */
-              fun enable(ctx: Context): Int {
-                  val n = nm(ctx)
-                  ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-                      .putInt("prev_filter", n.currentInterruptionFilter)
-                      .putBoolean("on", true).apply()
-                  n.setInterruptionFilter(NotificationManager.INTERRUPTION_FILTER_PRIORITY)
-                  return clearBackground(ctx)
-              }
-
-              fun disable(ctx: Context) {
-                  val p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                  if (hasPolicyAccess(ctx)) {
-                      val prev = p.getInt("prev_filter", NotificationManager.INTERRUPTION_FILTER_ALL)
-                      nm(ctx).setInterruptionFilter(
-                          if (prev == NotificationManager.INTERRUPTION_FILTER_UNKNOWN) NotificationManager.INTERRUPTION_FILTER_ALL else prev
-                      )
-                  }
-                  p.edit().putBoolean("on", false).apply()
-              }
-          }
-          __END__
-          mkdir -p app/src/main/java/com/gamecpu/mode
-          cat > app/src/main/java/com/gamecpu/mode/PerformanceActivity.kt <<'__END__'
-          package com.gamecpu.mode
-
-          import android.app.Activity
-          import android.content.Intent
-          import android.content.pm.ApplicationInfo
-          import android.content.pm.PackageManager
-          import android.graphics.Color
-          import android.os.Bundle
-          import android.os.Handler
-          import android.os.Looper
-          import android.provider.Settings
-          import android.widget.*
-          import rikka.shizuku.Shizuku
-
-          /** หน้าหลัก Game CPU mode: เปิดเกม + Game Mode, ปรับ CPU (ถ้าได้สิทธิ์), เชื่อม Shizuku */
-          class PerformanceActivity : Activity() {
-
-              private var canAdjust = false
-              private var gameSwitch: Switch? = null
-              private var gameListener: CompoundButton.OnCheckedChangeListener? = null
-
-              override fun onResume() {
-                  super.onResume()
-                  gameSwitch?.let { s ->
-                      s.setOnCheckedChangeListener(null)
-                      s.isChecked = GameMode.isOn(this)
-                      s.setOnCheckedChangeListener(gameListener)
-                  }
-              }
-
-              override fun onCreate(savedInstanceState: Bundle?) {
-                  super.onCreate(savedInstanceState)
-                  val dp = resources.displayMetrics.density
-                  val pad = (16 * dp).toInt()
-                  val prefs = getSharedPreferences("ui", MODE_PRIVATE)
-                  val green = Color.parseColor("#4CD964")
-                  val grey = Color.parseColor("#AAAAAA")
-
-                  val col = LinearLayout(this).apply {
-                      orientation = LinearLayout.VERTICAL
-                      setPadding(pad, pad * 2, pad, pad)
-                      setBackgroundColor(Color.parseColor("#1C1C1E"))
-                  }
-                  fun label(text: String, size: Float = 14f, color: Int = Color.WHITE) =
-                      TextView(this).apply { this.text = text; textSize = size; setTextColor(color) }
-                  fun section(text: String) =
-                      label(text, 16f).apply { setPadding(0, (20 * dp).toInt(), 0, 0) }
-
-                  col.addView(label("Game CPU mode", 20f))
-                  val status = label("กำลังตรวจสอบสิทธิ์...", 13f, grey)
-                  col.addView(status)
-
-                  // ---------- เปิดเกม ----------
-                  col.addView(section("เปิดเกม"))
-                  val pm = packageManager
-                  val games = pm.getInstalledApplications(0)
-                      .filter {
-                          (it.flags and ApplicationInfo.FLAG_SYSTEM) == 0 &&
-                              it.packageName != packageName &&
-                              pm.getLaunchIntentForPackage(it.packageName) != null
-                      }
-                      .sortedBy { pm.getApplicationLabel(it).toString().lowercase() }
-                  val spinner = Spinner(this)
-                  spinner.adapter = ArrayAdapter(
-                      this, android.R.layout.simple_spinner_dropdown_item,
-                      games.map { pm.getApplicationLabel(it).toString() }
-                  )
-                  val saved = prefs.getString("game_pkg", "com.roblox.client")
-                  val idx = games.indexOfFirst { it.packageName == saved }
-                  if (idx >= 0) spinner.setSelection(idx)
-                  col.addView(spinner)
-
-                  val launchBtn = Button(this).apply { text = "เปิดเกม + Game Mode" }
-                  launchBtn.setOnClickListener {
-                      if (games.isEmpty()) return@setOnClickListener
-                      val app = games[spinner.selectedItemPosition]
-                      prefs.edit().putString("game_pkg", app.packageName).apply()
-                      if (GameMode.hasPolicyAccess(this)) {
-                          if (!GameMode.isOn(this)) GameMode.enable(this) else GameMode.clearBackground(this)
-                      } else {
-                          GameMode.clearBackground(this)
-                          Toast.makeText(this, "ยังไม่ได้ให้สิทธิ์ห้ามรบกวน จึงล้างแรมอย่างเดียว", Toast.LENGTH_LONG).show()
-                      }
-                      pm.getLaunchIntentForPackage(app.packageName)?.let { startActivity(it) }
-                  }
-                  col.addView(launchBtn)
-
-                  // ---------- Game Mode ----------
-                  col.addView(section("Game Mode"))
-                  val gs = Switch(this).apply {
-                      text = "ห้ามรบกวน + ล้างแอปพื้นหลัง"; setTextColor(Color.WHITE)
-                      isChecked = GameMode.isOn(this@PerformanceActivity)
-                  }
-                  val ramText = label("แรมว่างตอนนี้ ${GameMode.freeRamMb(this)} MB", 12f, green)
-                  gameListener = CompoundButton.OnCheckedChangeListener { btn, on ->
-                      if (on) {
-                          if (!GameMode.hasPolicyAccess(this)) {
-                              btn.isChecked = false
-                              Toast.makeText(this, "เปิดสิทธิ์ \"ห้ามรบกวน\" ให้ Game CPU mode แล้วกลับมาเปิดสวิตช์อีกครั้ง", Toast.LENGTH_LONG).show()
-                              startActivity(Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS))
-                          } else if (!GameMode.isOn(this)) {
-                              val before = GameMode.freeRamMb(this)
-                              val n = GameMode.enable(this)
-                              Handler(Looper.getMainLooper()).postDelayed({
-                                  ramText.text = "สั่งปิดพื้นหลัง $n แอป | แรมว่าง $before → ${GameMode.freeRamMb(this)} MB"
-                              }, 1500)
-                          }
-                      } else if (GameMode.isOn(this)) {
-                          GameMode.disable(this)
-                      }
-                  }
-                  gs.setOnCheckedChangeListener(gameListener)
-                  gameSwitch = gs
-                  col.addView(gs)
-                  col.addView(ramText)
-
-                  // ---------- ปรับความเร็ว CPU ----------
-                  col.addView(section("ความเร็ว CPU"))
-                  val master = Switch(this).apply {
-                      text = "Clock speed customization"; setTextColor(Color.WHITE); isEnabled = false
-                  }
-                  col.addView(master)
-                  val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-                  col.addView(list)
-                  val reset = Button(this).apply { text = "คืนค่าเริ่มต้น"; isEnabled = false }
-                  col.addView(reset)
-
-                  // ---------- Shizuku ----------
-                  col.addView(section("Shizuku"))
-                  val shizukuText = label("", 12f, grey)
-                  val shizukuBtn = Button(this).apply { text = "เชื่อม Shizuku" }
-                  val testBtn = Button(this).apply { text = "ทดสอบสั่งปรับ CPU ผ่าน Shizuku" }
-                  fun refreshShizuku() {
-                      shizukuText.text = try {
-                          when {
-                              !Shizuku.pingBinder() -> "Shizuku: ไม่ทำงาน (เปิดแอป Shizuku แล้วกดเริ่มก่อน)"
-                              Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED -> "Shizuku: เชื่อมแล้ว"
-                              else -> "Shizuku: ทำงานอยู่ แต่ยังไม่ได้อนุญาตแอปนี้ กดปุ่มเชื่อม"
-                          }
-                      } catch (e: Throwable) { "Shizuku: ตรวจสอบไม่ได้" }
-                  }
-                  shizukuBtn.setOnClickListener {
-                      try {
-                          if (!Shizuku.pingBinder()) {
-                              Toast.makeText(this, "เปิดแอป Shizuku แล้วกดเริ่มก่อน", Toast.LENGTH_LONG).show()
-                          } else if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
-                              Shizuku.requestPermission(1001)
-                          }
-                      } catch (e: Throwable) {
-                          Toast.makeText(this, "เชื่อม Shizuku ไม่ได้", Toast.LENGTH_LONG).show()
-                      }
-                      refreshShizuku()
-                  }
-                  testBtn.setOnClickListener {
-                      Thread {
-                          val (ok, msg) = CpuController.testWriteViaShizuku()
-                          runOnUiThread {
-                              Toast.makeText(
-                                  this,
-                                  (if (ok) "ทดสอบผ่าน: " else "ทดสอบไม่ผ่าน: ") + msg,
-                                  Toast.LENGTH_LONG
-                              ).show()
-                              shizukuText.text = (if (ok) "ผลทดสอบ: ผ่าน (" else "ผลทดสอบ: ไม่ผ่าน (") + msg + ")"
-                              if (ok) recreate()
-                          }
-                      }.start()
-                  }
-                  try {
-                      Shizuku.addRequestPermissionResultListener { _, _ -> runOnUiThread { refreshShizuku() } }
-                  } catch (e: Throwable) { }
-                  refreshShizuku()
-                  col.addV
+        shell: bash
+        run: printf '%s' "$PAYLOAD" | base64 -d | tar xz
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GameCPUmode-apk
+          path: app/build/outputs/apk/debug/*.apk
+    env:
+      PAYLOAD: |
+        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
+        Xr4n5f8BRPIV3ACgAAA=
+# END-OF-FILE-OK
